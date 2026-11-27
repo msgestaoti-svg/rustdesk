@@ -1,6 +1,15 @@
-name: MS-Suporte_Remoto - Windows x64
+name: Suporte Remoto - Windows x64
 on:
   workflow_dispatch:
+    inputs:
+      brand:
+        description: Identidade visual
+        required: true
+        type: choice
+        default: ms
+        options:
+          - ms
+          - csa
 permissions:
   contents: read
 env:
@@ -11,6 +20,9 @@ env:
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   VCPKG_CMAKE_VERSION: "4.3.0"
   VERSION: "1.5.3"
+  BRAND: ${{ inputs.brand }}
+  APP_NAME: ${{ inputs.brand == 'csa' && 'CSA-Suporte_Remoto' || 'MS-Suporte_Remoto' }}
+  MANUFACTURER: ${{ inputs.brand == 'csa' && 'MS Tecnologia' || 'Marcelo Santana - Gestão em TI' }}
 jobs:
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
@@ -87,10 +99,54 @@ jobs:
           p = Path('libs/hbb_common/src/config.rs')
           text = p.read_text(encoding='utf-8')
           old = 'pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());'
-          new = old.replace('"RustDesk"', '"MS-Suporte_Remoto"')
+          import os
+          new = old.replace('"RustDesk"', '"' + os.environ['APP_NAME'] + '"')
           if text.count(old) != 1:
               raise SystemExit('Unexpected APP_NAME definition; patch not applied')
           p.write_text(text.replace(old, new), encoding='utf-8')
+          PYCODE
+
+      - name: Apply selected branding
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import os, shutil
+          from pathlib import Path
+          brand = os.environ['BRAND']
+          if brand not in ('ms', 'csa'):
+              raise SystemExit('Invalid brand')
+          source = Path('branding') / brand
+          targets = {
+              'app_icon.ico': 'flutter/windows/runner/resources/app_icon.ico',
+              'icon.ico': 'res/icon.ico',
+              'icon.png': 'res/icon.png',
+              'tray-icon.ico': 'res/tray-icon.ico',
+              'icon.svg': 'flutter/assets/icon.svg',
+              'logo.svg': 'res/logo.svg',
+              'logo-header.svg': 'res/logo-header.svg',
+          }
+          for name, target in targets.items():
+              shutil.copyfile(source / name, target)
+          if brand == 'csa':
+              shutil.copyfile(source / 'logo-header.svg', 'flutter/assets/csa-header.svg')
+              p = Path('flutter/lib/desktop/pages/desktop_home_page.dart')
+              text = p.read_text(encoding='utf-8')
+              anchor = 'child: loadLogo(),'
+              if text.count(anchor) != 1:
+                  raise SystemExit('Unexpected home page revision')
+              text = text.replace("import 'package:flutter/material.dart';", "import 'package:flutter/material.dart';\nimport 'package:flutter_svg/flutter_svg.dart';")
+              text = text.replace(anchor, """child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: SvgPicture.asset(
+                        'assets/csa-header.svg',
+                        width: 180,
+                        fit: BoxFit.contain,
+                      ),
+                    ),
+                  ),""")
+              p.write_text(text, encoding='utf-8')
           PYCODE
 
       - name: Restore bridge files
@@ -253,7 +309,7 @@ jobs:
           python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
           popd
           mkdir -p ./SignOutput
-          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/MS-Suporte_Remoto.exe
+          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/"${APP_NAME}.exe"
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
@@ -270,21 +326,21 @@ jobs:
         # is x64 / ARM64; the produced Package.msi is globbed since its bin/<platform>/ dir varies.
         run: |
           pushd ./res/msi
-          Rename-Item ../../rustdesk/rustdesk.exe MS-Suporte_Remoto.exe
-          python preprocess.py --arp -d ../../rustdesk --app-name "MS-Suporte_Remoto" --manufacturer "Marcelo Santana - Gestão em TI"
+          Rename-Item ../../rustdesk/rustdesk.exe "$env:APP_NAME.exe"
+          python preprocess.py --arp -d ../../rustdesk --app-name "$env:APP_NAME" --manufacturer "$env:MANUFACTURER"
           if ($LASTEXITCODE -ne 0) { throw "MSI preprocess failed" }
           git restore -- Package/License.rtf
           nuget restore msi.sln
           $msiPlatform = if ('${{ matrix.job.arch }}' -eq 'aarch64') { 'ARM64' } else { 'x64' }
           msbuild msi.sln -p:Configuration=Release -p:Platform=$msiPlatform /p:TargetVersion=Windows10
           $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
-          mv $msi.FullName ../../SignOutput/MS-Suporte_Remoto.msi
-          sha256sum ../../SignOutput/MS-Suporte_Remoto.msi
+          mv $msi.FullName "../../SignOutput/$env:APP_NAME.msi"
+          sha256sum "../../SignOutput/$env:APP_NAME.msi"
 
       - name: Upload Windows EXE and MSI
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: MS-Suporte_Remoto-windows-x64
+          name: ${{ env.APP_NAME }}-windows-x64
           path: SignOutput/*
           if-no-files-found: error
 
@@ -298,7 +354,7 @@ jobs:
       - name: Download Windows packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: MS-Suporte_Remoto-windows-x64
+          name: ${{ env.APP_NAME }}-windows-x64
           path: release-files
       - name: Create draft release
         env:
@@ -306,11 +362,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="ms-windows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tag="${BRAND}-windows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh release create "$tag" \
-            release-files/MS-Suporte_Remoto.exe \
-            release-files/MS-Suporte_Remoto.msi \
+            "release-files/${APP_NAME}.exe" \
+            "release-files/${APP_NAME}.msi" \
             --target "$GITHUB_SHA" \
-            --title "MS-Suporte_Remoto - Windows x64 (${GITHUB_RUN_NUMBER})" \
+            --title "${APP_NAME} - Windows x64 (${GITHUB_RUN_NUMBER})" \
             --notes "Cliente personalizado baseado no RustDesk, AGPL-3.0. Código e alterações de compilação: https://github.com/${GH_REPO}/tree/${GITHUB_SHA}." \
             --draft
