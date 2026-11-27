@@ -1,4 +1,140 @@
-if: ${{ matrix.job.arch == 'x86_64' }}
+name: MS-Suporte_Remoto - Windows x64
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  SCITER_RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_CMAKE_VERSION: "4.3.0"
+  VERSION: "1.5.3"
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+  build-RustDeskTempTopMostWindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+  build-for-windows-flutter:
+    name: ${{ matrix.job.target }}
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          # - { target: i686-pc-windows-msvc        , os: windows-2022                  }
+          # - { target: x86_64-pc-windows-gnu       , os: windows-2022                  }
+          - {
+              target: x86_64-pc-windows-msvc,
+              os: windows-2022,
+              arch: x86_64,
+              flutter-arch: x64,
+              vcpkg-triplet: x64-windows-static,
+              build-args: "--vram",
+            }
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Configure default self-hosted server
+        shell: bash
+        env:
+          RENDEZVOUS_SERVER: ${{ vars.RENDEZVOUS_SERVER }}
+          RS_PUB_KEY: ${{ vars.RS_PUB_KEY }}
+        run: |
+          python - <<'PYCODE'
+          import os, base64
+          from pathlib import Path
+          server = os.environ['RENDEZVOUS_SERVER'].strip()
+          key = os.environ['RS_PUB_KEY'].strip()
+          if not server or len(base64.b64decode(key, validate=True)) != 32:
+              raise SystemExit('Invalid server or public key')
+          p = Path('libs/hbb_common/src/config.rs')
+          text = p.read_text(encoding='utf-8')
+          old = 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();'
+          new = '''pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([
+              ("custom-rendezvous-server".to_owned(), env!("RENDEZVOUS_SERVER").trim().to_owned()),
+              ("key".to_owned(), env!("RS_PUB_KEY").trim().to_owned()),
+          ]));'''
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected config.rs revision; patch not applied')
+          p.write_text(text.replace(old, new), encoding='utf-8')
+          PYCODE
+          printf 'RENDEZVOUS_SERVER=%s\nRS_PUB_KEY=%s\n' "$RENDEZVOUS_SERVER" "$RS_PUB_KEY" >> "$GITHUB_ENV"
+
+      - name: Set custom application name
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          from pathlib import Path
+          p = Path('libs/hbb_common/src/config.rs')
+          text = p.read_text(encoding='utf-8')
+          old = 'pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());'
+          new = old.replace('"RustDesk"', '"MS-Suporte_Remoto"')
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected APP_NAME definition; patch not applied')
+          p.write_text(text.replace(old, new), encoding='utf-8')
+          PYCODE
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          # arm64 is on Flutter 3.44, so it needs the bridge generated with the same Flutter
+          # (its *.freezed.dart must match the freezed the arm64 build resolves). x64 and every
+          # other platform keep the default 3.22.3-generated bridge.
+          name: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        id: flutter
+        # arm64 builds with FLUTTER_WINDOWS_ARM_VERSION (>=3.44); x64 stays on FLUTTER_VERSION.
+        # subosito only ships an x64 Windows SDK (Flutter's release manifest lists x64 only),
+        # so it installs x64 on both arches. The arm64 runner re-bootstraps Dart to arm64 in
+        # the next step.
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225  # v2.12.0; https://github.com/subosito/flutter-action/issues/277
+        with:
+          channel: "stable"
+          flutter-version: ${{ matrix.job.arch == 'aarch64' && env.FLUTTER_WINDOWS_ARM_VERSION || env.FLUTTER_VERSION }}
+          architecture: x64
+
+      # https://github.com/flutter/flutter/issues/155685
+      # x64 only: arm64 uses the stock native arm64 Windows engine, and the rustdesk/engine
+      # windows-x64-release.zip is built for the 3.24-era x64 engine (matches FLUTTER_VERSION).
+      - name: Replace engine with rustdesk custom flutter engine
+        if: ${{ matrix.job.arch == 'x86_64' }}
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        # x64 stays on Flutter 3.24.5, which needs the dropdown filter patch.
+        # arm64 is on Flutter 3.44 (patched separately below) and does not use this patch.
+        if: ${{ matrix.job.arch == 'x86_64' }}
         shell: bash
         run: |
           cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
@@ -117,7 +253,7 @@ if: ${{ matrix.job.arch == 'x86_64' }}
           python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
           popd
           mkdir -p ./SignOutput
-          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/"${APP_NAME}.exe"
+          mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/MS-Suporte_Remoto.exe
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
@@ -134,21 +270,21 @@ if: ${{ matrix.job.arch == 'x86_64' }}
         # is x64 / ARM64; the produced Package.msi is globbed since its bin/<platform>/ dir varies.
         run: |
           pushd ./res/msi
-          Rename-Item ../../rustdesk/rustdesk.exe "$env:APP_NAME.exe"
-          python preprocess.py --arp -d ../../rustdesk --app-name "$env:APP_NAME" --manufacturer "$env:MANUFACTURER"
+          Rename-Item ../../rustdesk/rustdesk.exe MS-Suporte_Remoto.exe
+          python preprocess.py --arp -d ../../rustdesk --app-name "MS-Suporte_Remoto" --manufacturer "Marcelo Santana - Gestão em TI"
           if ($LASTEXITCODE -ne 0) { throw "MSI preprocess failed" }
           git restore -- Package/License.rtf
           nuget restore msi.sln
           $msiPlatform = if ('${{ matrix.job.arch }}' -eq 'aarch64') { 'ARM64' } else { 'x64' }
           msbuild msi.sln -p:Configuration=Release -p:Platform=$msiPlatform /p:TargetVersion=Windows10
           $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
-          mv $msi.FullName "../../SignOutput/$env:APP_NAME.msi"
-          sha256sum "../../SignOutput/$env:APP_NAME.msi"
+          mv $msi.FullName ../../SignOutput/MS-Suporte_Remoto.msi
+          sha256sum ../../SignOutput/MS-Suporte_Remoto.msi
 
       - name: Upload Windows EXE and MSI
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: ${{ env.APP_NAME }}-windows-x64
+          name: MS-Suporte_Remoto-windows-x64
           path: SignOutput/*
           if-no-files-found: error
 
@@ -162,7 +298,7 @@ if: ${{ matrix.job.arch == 'x86_64' }}
       - name: Download Windows packages
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: ${{ env.APP_NAME }}-windows-x64
+          name: MS-Suporte_Remoto-windows-x64
           path: release-files
       - name: Create draft release
         env:
@@ -170,11 +306,11 @@ if: ${{ matrix.job.arch == 'x86_64' }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="${BRAND}-windows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tag="ms-windows-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           gh release create "$tag" \
-            "release-files/${APP_NAME}.exe" \
-            "release-files/${APP_NAME}.msi" \
+            release-files/MS-Suporte_Remoto.exe \
+            release-files/MS-Suporte_Remoto.msi \
             --target "$GITHUB_SHA" \
-            --title "${APP_NAME} - Windows x64 (${GITHUB_RUN_NUMBER})" \
+            --title "MS-Suporte_Remoto - Windows x64 (${GITHUB_RUN_NUMBER})" \
             --notes "Cliente personalizado baseado no RustDesk, AGPL-3.0. Código e alterações de compilação: https://github.com/${GH_REPO}/tree/${GITHUB_SHA}." \
             --draft
