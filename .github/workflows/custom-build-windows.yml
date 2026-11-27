@@ -65,6 +65,24 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Set MS installer shortcut names
+        if: ${{ inputs.brand == 'ms' }}
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          from pathlib import Path
+          p = Path('res/msi/Package/Components/RustDesk.wxs')
+          text = p.read_text(encoding='utf-8')
+          for shortcut in ('App.StartMenu.Shortcut', 'App.Desktop.Shortcut'):
+              old = f'<Shortcut Id="{shortcut}" Name="!(loc.SC_Client)"'
+              new = f'<Shortcut Id="{shortcut}" Name="MS - Suporte Remoto"'
+              if text.count(old) != 1:
+                  raise SystemExit(f'Unexpected shortcut definition: {shortcut}')
+              text = text.replace(old, new)
+          p.write_text(text, encoding='utf-8')
+          print('Updated both visible shortcuts; technical identifiers unchanged')
+          PYCODE
+
       - name: Configure default self-hosted server
         shell: bash
         env:
@@ -329,40 +347,6 @@ jobs:
           # (C3859/C1076 were reported by HostX86\arm64\CL.exe).
           # Keep the action's default x86 MSBuild for the existing x64 MSI job.
           msbuild-architecture: ${{ matrix.job.arch == 'aarch64' && 'arm64' || 'x86' }}
-
-      - name: Set MS installer display names
-        if: ${{ inputs.brand == 'ms' }}
-        shell: bash
-        run: |
-          python - <<'PYCODE'
-          import re
-          from pathlib import Path
-          root = Path('res/msi/Package')
-          product = '$(var.Product)'
-          display = 'MS - Suporte Remoto'
-          package = root / 'Package.wxs'
-          text = package.read_text(encoding='utf-8-sig')
-          old = '<Package Name="$(var.Product)"'
-          if text.count(old) != 1:
-              raise SystemExit('Unexpected MSI package name')
-          package.write_text(text.replace(old, '<Package Name="' + display + '"'), encoding='utf-8-sig')
-          count = 0
-          for p in root.rglob('*.wxs'):
-              raw = p.read_bytes()
-              text = raw.decode('utf-8-sig')
-              def rename(m):
-                  global count
-                  tag = m.group(0)
-                  new, n = re.subn(r'(?<![\w:])Name="\$\(var\.Product\)"', 'Name="' + display + '"', tag)
-                  count += n
-                  return new
-              updated = re.sub(r'<Shortcut\b[^>]*>', rename, text)
-              if updated != text:
-                  p.write_bytes((b'\xef\xbb\xbf' if raw.startswith(b'\xef\xbb\xbf') else b'') + updated.encode('utf-8'))
-          if not count:
-              raise SystemExit('No matching MSI shortcut names; inspect WiX source before proceeding')
-          print(f'Updated {count} shortcut definitions')
-          PYCODE
 
       - name: Build msi
         # Builds the MSI for the matrix arch. res/msi (WiX v4 + native CustomActions) carries
