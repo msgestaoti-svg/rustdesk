@@ -127,26 +127,36 @@ jobs:
           }
           for name, target in targets.items():
               shutil.copyfile(source / name, target)
-          if brand == 'csa':
-              shutil.copyfile(source / 'logo-header.svg', 'flutter/assets/csa-header.svg')
-              p = Path('flutter/lib/desktop/pages/desktop_home_page.dart')
-              text = p.read_text(encoding='utf-8')
-              anchor = 'child: loadLogo(),'
+          shutil.copyfile(source / 'logo-header.svg', 'flutter/assets/brand-header.svg')
+          p = Path('flutter/lib/desktop/pages/desktop_home_page.dart')
+          text = p.read_text(encoding='utf-8')
+          anchor = 'child: loadLogo(),'
+          if text.count(anchor) != 1:
+              raise SystemExit('Unexpected home page revision')
+          text = text.replace("import 'package:flutter/material.dart';", "import 'package:flutter/material.dart';\nimport 'package:flutter_svg/flutter_svg.dart';")
+          text = text.replace(anchor, """child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: SvgPicture.asset(
+                    'assets/brand-header.svg',
+                    width: 180,
+                    fit: BoxFit.contain,
+                  ),
+                ),
+              ),""")
+          if brand == 'ms':
+              anchor = '      buildTip(context),'
               if text.count(anchor) != 1:
-                  raise SystemExit('Unexpected home page revision')
-              text = text.replace("import 'package:flutter/material.dart';", "import 'package:flutter/material.dart';\nimport 'package:flutter_svg/flutter_svg.dart';")
-              text = text.replace(anchor, """child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(4),
-                      child: SvgPicture.asset(
-                        'assets/csa-header.svg',
-                        width: 180,
-                        fit: BoxFit.contain,
-                      ),
-                    ),
-                  ),""")
-              p.write_text(text, encoding='utf-8')
+                  raise SystemExit('Unexpected home page display anchor')
+              text = text.replace(anchor, """      const Padding(
+                padding: EdgeInsets.only(bottom: 8),
+                child: Center(child: Text('MS - Suporte Remoto',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontWeight: FontWeight.w600))),
+              ),
+          buildTip(context),""")
+          p.write_text(text, encoding='utf-8')
           PYCODE
 
       - name: Restore bridge files
@@ -319,6 +329,40 @@ jobs:
           # (C3859/C1076 were reported by HostX86\arm64\CL.exe).
           # Keep the action's default x86 MSBuild for the existing x64 MSI job.
           msbuild-architecture: ${{ matrix.job.arch == 'aarch64' && 'arm64' || 'x86' }}
+
+      - name: Set MS installer display names
+        if: ${{ inputs.brand == 'ms' }}
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import re
+          from pathlib import Path
+          root = Path('res/msi/Package')
+          product = '$(var.Product)'
+          display = 'MS - Suporte Remoto'
+          package = root / 'Package.wxs'
+          text = package.read_text(encoding='utf-8-sig')
+          old = '<Package Name="$(var.Product)"'
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected MSI package name')
+          package.write_text(text.replace(old, '<Package Name="' + display + '"'), encoding='utf-8-sig')
+          count = 0
+          for p in root.rglob('*.wxs'):
+              raw = p.read_bytes()
+              text = raw.decode('utf-8-sig')
+              def rename(m):
+                  global count
+                  tag = m.group(0)
+                  new, n = re.subn(r'(?<![\w:])Name="\$\(var\.Product\)"', 'Name="' + display + '"', tag)
+                  count += n
+                  return new
+              updated = re.sub(r'<Shortcut\b[^>]*>', rename, text)
+              if updated != text:
+                  p.write_bytes((b'\xef\xbb\xbf' if raw.startswith(b'\xef\xbb\xbf') else b'') + updated.encode('utf-8'))
+          if not count:
+              raise SystemExit('No matching MSI shortcut names; inspect WiX source before proceeding')
+          print(f'Updated {count} shortcut definitions')
+          PYCODE
 
       - name: Build msi
         # Builds the MSI for the matrix arch. res/msi (WiX v4 + native CustomActions) carries
