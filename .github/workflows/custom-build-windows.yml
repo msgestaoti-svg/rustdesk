@@ -270,7 +270,10 @@ jobs:
         # is x64 / ARM64; the produced Package.msi is globbed since its bin/<platform>/ dir varies.
         run: |
           pushd ./res/msi
-          python preprocess.py --arp -d ../../rustdesk
+          Rename-Item ../../rustdesk/rustdesk.exe MS-Suporte_Remoto.exe
+          python preprocess.py --arp -d ../../rustdesk --app-name "MS-Suporte_Remoto" --manufacturer "Marcelo Santana - Gestão em TI"
+          if ($LASTEXITCODE -ne 0) { throw "MSI preprocess failed" }
+          git restore -- Package/License.rtf
           nuget restore msi.sln
           $msiPlatform = if ('${{ matrix.job.arch }}' -eq 'aarch64') { 'ARM64' } else { 'x64' }
           msbuild msi.sln -p:Configuration=Release -p:Platform=$msiPlatform /p:TargetVersion=Windows10
