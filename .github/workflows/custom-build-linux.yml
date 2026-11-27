@@ -1,0 +1,524 @@
+name: Suporte Remoto - Linux AMD64
+'on':
+  workflow_dispatch:
+    inputs:
+      brand:
+        description: Identidade visual
+        required: true
+        type: choice
+        default: ms
+        options:
+        - ms
+        - csa
+      build:
+        description: 'Compilar DEB (desmarcado: apenas preflight)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+env:
+  RUST_VERSION: '1.75'
+  FLUTTER_VERSION: 3.24.5
+  VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+  VCPKG_COMMIT_ID: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+  VERSION: 1.5.3
+  BRAND: ${{ inputs.brand }}
+  DISPLAY_NAME: ${{ inputs.brand == 'csa' && 'CSA - Suporte Remoto' || 'MS - Suporte Remoto' }}
+jobs:
+  preflight:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+        persist-credentials: false
+    - name: Install image tooling
+      run: sudo apt-get update -y && sudo apt-get install -y python3-pil
+    - name: Configure default self-hosted server
+      shell: bash
+      env:
+        RENDEZVOUS_SERVER: ${{ vars.RENDEZVOUS_SERVER }}
+        RS_PUB_KEY: ${{ vars.RS_PUB_KEY }}
+      run: |
+        python - <<'PYCODE'
+        import os, base64, json, re
+        from pathlib import Path
+        server = os.environ['RENDEZVOUS_SERVER'].strip()
+        key = os.environ['RS_PUB_KEY'].strip()
+        if not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?", server) or len(base64.b64decode(key, validate=True)) != 32:
+            raise SystemExit('Invalid server or public key')
+        p = Path('libs/hbb_common/src/config.rs')
+        text = p.read_text(encoding='utf-8')
+        old = 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();'
+        new = '''pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([
+            ("custom-rendezvous-server".to_owned(), {server_literal}.to_owned()),
+            ("key".to_owned(), {key_literal}.to_owned()),
+        ]));'''
+        new = new.replace('{server_literal}', json.dumps(server)).replace('{key_literal}', json.dumps(key))
+        if text.count(old) != 1:
+            raise SystemExit('Unexpected config.rs revision; patch not applied')
+        p.write_text(text.replace(old, new), encoding='utf-8')
+        PYCODE
+    - name: Apply selected branding
+      shell: bash
+      run: |
+        python - <<'PYCODE'
+        import os, shutil
+        from pathlib import Path
+        brand = os.environ['BRAND']
+        if brand not in ('ms', 'csa'):
+            raise SystemExit('Invalid brand')
+        source = Path('branding') / brand
+        targets = {
+            'icon.ico': 'res/icon.ico',
+            'icon.png': 'res/icon.png',
+            'tray-icon.ico': 'res/tray-icon.ico',
+            'icon.svg': 'flutter/assets/icon.svg',
+            'logo.svg': 'res/logo.svg',
+            'logo-header.svg': 'res/logo-header.svg',
+        }
+        for name, target in targets.items():
+            shutil.copyfile(source / name, target)
+        shutil.copyfile(source / 'logo-header.svg', 'flutter/assets/brand-header.svg')
+        p = Path('flutter/lib/desktop/pages/desktop_home_page.dart')
+        text = p.read_text(encoding='utf-8')
+        anchor = 'child: loadLogo(),'
+        if text.count(anchor) != 1:
+            raise SystemExit('Unexpected home page revision')
+        text = text.replace("import 'package:flutter/material.dart';", "import 'package:flutter/material.dart';\nimport 'package:flutter_svg/flutter_svg.dart';")
+        text = text.replace(anchor, """child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: SvgPicture.asset(
+                  'assets/brand-header.svg',
+                  width: 180,
+                  fit: BoxFit.contain,
+                ),
+              ),
+            ),""")
+        if True:
+            anchor = '      buildTip(context),'
+            if text.count(anchor) != 1:
+                raise SystemExit('Unexpected home page display anchor')
+            text = text.replace(anchor, """      const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: Center(child: Text('BRAND_DISPLAY_PLACEHOLDER',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontWeight: FontWeight.w600))),
+            ),
+        buildTip(context),""")
+        display = os.environ['DISPLAY_NAME']
+        text = text.replace('BRAND_DISPLAY_PLACEHOLDER', display)
+        p.write_text(text, encoding='utf-8')
+        shutil.copyfile(source / 'icon.svg', 'res/scalable.svg')
+        from PIL import Image
+        with Image.open(source / 'icon.png') as im:
+            im.convert('RGBA').resize((256, 256), getattr(Image, "Resampling", Image).LANCZOS).save('res/128x128@2x.png')
+        for filename in ('res/rustdesk.desktop', 'res/rustdesk-link.desktop', 'res/rustdesk.service'):
+            f = Path(filename)
+            t = f.read_text(encoding='utf-8')
+            anchor = 'Description=RustDesk' if filename.endswith('.service') else 'Name=RustDesk'
+            if t.count(anchor) != 1:
+                raise SystemExit(f'Unexpected branding anchor: {filename}')
+            f.write_text(t.replace(anchor, anchor.split('=')[0] + '=' + display), encoding='utf-8')
+        PYCODE
+  generate-bridge:
+    needs: preflight
+    if: ${{ inputs.build }}
+    uses: ./.github/workflows/bridge.yml
+  build-rustdesk-linux:
+    needs:
+    - preflight
+    - generate-bridge
+    name: build rustdesk linux ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - arch: x86_64
+          target: x86_64-unknown-linux-gnu
+          distro: ubuntu18.04
+          true: ubuntu-22.04
+          deb_arch: amd64
+          vcpkg-triplet: x64-linux
+    steps:
+    - name: Export GitHub Actions cache environment variables
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Maximize build space
+      run: |
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/share/dotnet
+        sudo apt-get update -y
+        sudo apt-get install -y nasm
+        if [[ "${{ matrix.job.arch }}" == "x86_64" ]]; then
+          sudo apt-get install -y qemu-user-static
+        fi
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+        persist-credentials: false
+    - name: Install image tooling
+      run: sudo apt-get install -y python3-pil
+    - name: Configure default self-hosted server
+      shell: bash
+      env:
+        RENDEZVOUS_SERVER: ${{ vars.RENDEZVOUS_SERVER }}
+        RS_PUB_KEY: ${{ vars.RS_PUB_KEY }}
+      run: |
+        python - <<'PYCODE'
+        import os, base64, json, re
+        from pathlib import Path
+        server = os.environ['RENDEZVOUS_SERVER'].strip()
+        key = os.environ['RS_PUB_KEY'].strip()
+        if not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?", server) or len(base64.b64decode(key, validate=True)) != 32:
+            raise SystemExit('Invalid server or public key')
+        p = Path('libs/hbb_common/src/config.rs')
+        text = p.read_text(encoding='utf-8')
+        old = 'pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();'
+        new = '''pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(HashMap::from([
+            ("custom-rendezvous-server".to_owned(), {server_literal}.to_owned()),
+            ("key".to_owned(), {key_literal}.to_owned()),
+        ]));'''
+        new = new.replace('{server_literal}', json.dumps(server)).replace('{key_literal}', json.dumps(key))
+        if text.count(old) != 1:
+            raise SystemExit('Unexpected config.rs revision; patch not applied')
+        p.write_text(text.replace(old, new), encoding='utf-8')
+        PYCODE
+    - name: Apply selected branding
+      shell: bash
+      run: |
+        python - <<'PYCODE'
+        import os, shutil
+        from pathlib import Path
+        brand = os.environ['BRAND']
+        if brand not in ('ms', 'csa'):
+            raise SystemExit('Invalid brand')
+        source = Path('branding') / brand
+        targets = {
+            'icon.ico': 'res/icon.ico',
+            'icon.png': 'res/icon.png',
+            'tray-icon.ico': 'res/tray-icon.ico',
+            'icon.svg': 'flutter/assets/icon.svg',
+            'logo.svg': 'res/logo.svg',
+            'logo-header.svg': 'res/logo-header.svg',
+        }
+        for name, target in targets.items():
+            shutil.copyfile(source / name, target)
+        shutil.copyfile(source / 'logo-header.svg', 'flutter/assets/brand-header.svg')
+        p = Path('flutter/lib/desktop/pages/desktop_home_page.dart')
+        text = p.read_text(encoding='utf-8')
+        anchor = 'child: loadLogo(),'
+        if text.count(anchor) != 1:
+            raise SystemExit('Unexpected home page revision')
+        text = text.replace("import 'package:flutter/material.dart';", "import 'package:flutter/material.dart';\nimport 'package:flutter_svg/flutter_svg.dart';")
+        text = text.replace(anchor, """child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: SvgPicture.asset(
+                  'assets/brand-header.svg',
+                  width: 180,
+                  fit: BoxFit.contain,
+                ),
+              ),
+            ),""")
+        if True:
+            anchor = '      buildTip(context),'
+            if text.count(anchor) != 1:
+                raise SystemExit('Unexpected home page display anchor')
+            text = text.replace(anchor, """      const Padding(
+              padding: EdgeInsets.only(bottom: 8),
+              child: Center(child: Text('BRAND_DISPLAY_PLACEHOLDER',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontWeight: FontWeight.w600))),
+            ),
+        buildTip(context),""")
+        display = os.environ['DISPLAY_NAME']
+        text = text.replace('BRAND_DISPLAY_PLACEHOLDER', display)
+        p.write_text(text, encoding='utf-8')
+        shutil.copyfile(source / 'icon.svg', 'res/scalable.svg')
+        from PIL import Image
+        with Image.open(source / 'icon.png') as im:
+            im.convert('RGBA').resize((256, 256), getattr(Image, "Resampling", Image).LANCZOS).save('res/128x128@2x.png')
+        for filename in ('res/rustdesk.desktop', 'res/rustdesk-link.desktop', 'res/rustdesk.service'):
+            f = Path(filename)
+            t = f.read_text(encoding='utf-8')
+            anchor = 'Description=RustDesk' if filename.endswith('.service') else 'Name=RustDesk'
+            if t.count(anchor) != 1:
+                raise SystemExit(f'Unexpected branding anchor: {filename}')
+            f.write_text(t.replace(anchor, anchor.split('=')[0] + '=' + display), encoding='utf-8')
+        PYCODE
+    - name: Set Swap Space
+      uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c
+      with:
+        swap-size-gb: 12
+    - name: Free Space
+      run: |
+        df -h
+        free -m
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      with:
+        toolchain: ${{ env.RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - name: Save Rust toolchain version
+      run: |
+        RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')
+        echo "RUST_TOOLCHAIN_VERSION=$RUST_TOOLCHAIN_VERSION" >> $GITHUB_ENV
+    - name: Disable rust bridge build
+      run: |
+        # only build cdylib
+        sed -i  "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
+    - name: Setup vcpkg with Github Actions binary cache
+      uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+      with:
+        vcpkgDirectory: /opt/artifacts/vcpkg
+        vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+        doNotCache: false
+    - name: Install vcpkg dependencies
+      run: |
+        sudo apt install -y libva-dev && apt show libva-dev
+        if ! $VCPKG_ROOT/vcpkg \
+          install \
+          --triplet ${{ matrix.job.vcpkg-triplet }} \
+          --x-install-root="$VCPKG_ROOT/installed"; then
+          find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+            echo "$_1:"
+            echo "======"
+            cat "$_1"
+            echo "======"
+            echo ""
+          done
+          exit 1
+        fi
+        head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+      shell: bash
+    - name: Restore bridge files
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: bridge-artifact
+        path: ./
+    - name: Build libdrmtap
+      run: |
+        sudo apt-get install -y meson ninja-build pkg-config \
+          libdrm-dev libegl1-mesa-dev libgles2-mesa-dev
+        python3 - <<'PY'
+        import importlib.util, sys
+        spec = importlib.util.spec_from_file_location("b", "build.py")
+        b = importlib.util.module_from_spec(spec)
+        sys.argv = ["build.py"]
+        spec.loader.exec_module(b)
+        print(f"::notice::built {b.build_libdrmtap_so()}")
+        PY
+      shell: bash
+    - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+      name: Build rustdesk
+      id: vcpkg
+      with:
+        arch: ${{ matrix.job.arch }}
+        distro: ${{ matrix.job.distro }}
+        githubToken: ${{ github.token }}
+        setup: |
+          ls -l "${PWD}"
+          ls -l /opt/artifacts/vcpkg/installed
+        dockerRunArgs: |
+          --volume "${PWD}:/workspace"
+          --volume "/opt/artifacts:/opt/artifacts"
+        shell: /bin/bash
+        install: |
+          apt-get update -y
+          echo -e "installing deps"
+          apt-get install -y \
+             build-essential \
+             clang \
+             cmake \
+             curl \
+             gcc \
+             git \
+             g++ \
+             libayatana-appindicator3-dev \
+             libasound2-dev \
+             libclang-10-dev \
+             libgstreamer1.0-dev \
+             libgstreamer-plugins-base1.0-dev \
+             libgtk-3-dev \
+             libpulse-dev \
+             libva-dev \
+             libxcb-randr0-dev \
+             libxcb-shape0-dev \
+             libxcb-xfixes0-dev \
+             libxdo-dev \
+             libxfixes-dev \
+             llvm-10-dev \
+             nasm \
+             ninja-build \
+             pkg-config \
+             tree \
+             python3 \
+             rpm \
+             unzip \
+             wget \
+             xz-utils \
+             libssl-dev
+          # we have libopus compiled by us.
+          apt-get remove -y libopus-dev || true
+          # output devs
+          ls -l ./
+          tree -L 3 /opt/artifacts/vcpkg/installed
+        run: |+
+          set -euo pipefail
+          # disable git safe.directory
+          git config --global --add safe.directory /workspace
+          git config --global --add safe.directory /opt/flutter
+          # rust
+          pushd /opt
+          # do not use rustup, because memory overflow in qemu
+          wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}.tar.gz
+          tar -zxvf rust.tar.gz > /dev/null && rm rust.tar.gz
+          cd rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }} && ./install.sh
+          rm -rf rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}
+          # edit config
+          mkdir -p ~/.cargo/
+          echo """
+            [source.crates-io]
+            registry = 'https://github.com/rust-lang/crates.io-index'
+          """ > ~/.cargo/config
+          cat ~/.cargo/config
+          # start build
+          pushd /workspace
+          export VCPKG_ROOT=/opt/artifacts/vcpkg
+          # use the .so built on the runner; build.py checks it is the pinned checkout
+          export DRMTAP_PREBUILT_DIR=/workspace/third_party/libdrmtap/build-pkg
+          if [[ "${{ matrix.job.arch }}" == "aarch64" ]]; then
+            export JOBS="--jobs 3"
+          else
+            export JOBS=""
+          fi
+          echo $JOBS
+          cargo build --locked --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste,drm,drm-wake --release
+          rm -rf target/release/deps target/release/build
+          rm -rf ~/.cargo
+
+          # Setup Flutter
+          # disable git safe.directory
+          git config --global --add safe.directory /workspace
+          git config --global --add safe.directory /opt/flutter
+          pushd /workspace
+          case ${{ matrix.job.arch }} in
+            aarch64)
+              export PATH=/opt/flutter-elinux/bin:$PATH
+              sed -i "s/flutter build linux --release/flutter-elinux build linux --verbose/g" ./build.py
+              sed -i "s/x64\/release/arm64\/release/g" ./build.py
+            ;;
+            x86_64)
+              export PATH=/opt/flutter/bin:$PATH
+            ;;
+          esac
+          popd
+          pushd /opt
+          wget https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+          tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+          case ${{ matrix.job.arch }} in
+            aarch64)
+              # clone repo and reset to flutter ${{ env.FLUTTER_VERSION }}
+              git clone https://github.com/sony/flutter-elinux.git || true
+              pushd flutter-elinux
+                git fetch
+                git reset --hard ${{ env.FLUTTER_VERSION }}
+                bin/flutter-elinux doctor -v
+                bin/flutter-elinux precache --linux
+              popd
+              cp -R flutter/bin/cache/artifacts/engine/linux-x64/shader_lib flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64
+              rm -rf flutter
+            ;;
+            x86_64)
+              flutter doctor -v
+            ;;
+          esac
+
+          if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
+            case ${{ matrix.job.arch }} in
+              aarch64)
+                pushd /opt/flutter-elinux/flutter
+              ;;
+              x86_64)
+                pushd /opt/flutter
+              ;;
+            esac
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+            popd
+          fi
+
+          # build flutter
+          pushd /workspace
+          export CARGO_INCREMENTAL=0
+          export DEB_ARCH=${{ matrix.job.deb_arch }}
+          python3 ./build.py --flutter --skip-cargo
+          for name in rustdesk*??.deb; do
+            mv "$name" "${name%%.deb}-${{ matrix.job.arch }}.deb"
+          done
+
+    - name: Check the deb carries libdrmtap
+      run: |
+        set -euo pipefail
+        # Resolve by glob, not from env.VERSION: build.py names the deb from Cargo.toml, so a
+        # hardcoded name fails with a bare exit 1 the first time those two drift.
+        shopt -s nullglob
+        debs=(rustdesk-*-${{ matrix.job.arch }}.deb)
+        if [ "${#debs[@]}" -ne 1 ]; then
+          echo "::error::expected one rustdesk-*-${{ matrix.job.arch }}.deb, found ${#debs[@]}: ${debs[*]-none}"
+          exit 1
+        fi
+        deb="${debs[0]}"
+        contents="$(dpkg -c "$deb")"
+        if [[ ! "$contents" =~ usr/lib/rustdesk/libdrmtap\.so\.0\.[0-9]+\.[0-9]+ ]]; then
+          echo "::error::$deb has no versioned libdrmtap.so.0.x.y"
+          exit 1
+        fi
+        if [[ "$contents" != *"usr/lib/rustdesk/libdrmtap.so.0 ->"* ]]; then
+          echo "::error::$deb has no libdrmtap.so.0 soname symlink"
+          exit 1
+        fi
+        rm -rf /tmp/deb && dpkg-deb -R "$deb" /tmp/deb
+        if ! grep -qF /usr/lib/rustdesk/libdrmtap.so.0 /tmp/deb/usr/share/rustdesk/lib/librustdesk.so; then
+          echo "::error::$deb was not built with the drm feature"
+          exit 1
+        fi
+      shell: bash
+    - name: Validate and stage DEB
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        packages=(rustdesk-*-x86_64.deb)
+        [[ ${#packages[@]} == 1 ]]
+        deb="${packages[0]}"
+        [[ $(dpkg-deb -f "$deb" Package) == rustdesk ]]
+        [[ $(dpkg-deb -f "$deb" Architecture) == amd64 ]]
+        [[ $(dpkg-deb -f "$deb" Version) == "$VERSION" ]]
+        root=$(mktemp -d)
+        dpkg-deb -R "$deb" "$root"
+        test -x "$root/usr/share/rustdesk/rustdesk"
+        test -f "$root/usr/share/rustdesk/lib/librustdesk.so"
+        grep -Fx "Name=$DISPLAY_NAME" "$root/usr/share/applications/rustdesk.desktop"
+        grep -Fx "Description=$DISPLAY_NAME" "$root/usr/share/rustdesk/files/systemd/rustdesk.service"
+        for script in postinst prerm postrm; do bash -n "$root/DEBIAN/$script"; done
+        mkdir -p release-files
+        cp "$deb" "release-files/${BRAND}-suporte-remoto-${VERSION}-amd64.deb"
+        (cd release-files && sha256sum *.deb > SHA256SUMS)
+    - name: Upload test package
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.BRAND }}-linux-amd64
+        path: release-files/
+        if-no-files-found: error
+    if: ${{ inputs.build }}
